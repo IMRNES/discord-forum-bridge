@@ -3,7 +3,7 @@ name: Deploy
 # Deploys to imrnes over SSH after CI is green. The key in authorized_keys runs
 # /usr/local/bin/gh-actions-bridge as a FORCED COMMAND, so this workflow cannot
 # obtain a shell on the host even if the runner token leaks: the allowlist is the
-# deploy script plus two read-only probes. `.env` (NodeBB API token, Discord bot
+# deploy script plus two read-only probes. `.env` (NodeBB master token, Discord bot
 # token) is not readable through it.
 
 on:
@@ -13,6 +13,8 @@ on:
 
 concurrency:
   group: discord-forum-bridge-deploy-${{ github.ref }}
+  # Never cancel: the deploy restarts the bridge, and an aborted restart leaves it
+  # between two releases with its mirror cursors half-written.
   cancel-in-progress: false
 
 permissions:
@@ -24,58 +26,47 @@ jobs:
     runs-on: ubuntu-latest
     # Deploy lives in this workflow, so it cannot `needs:` the CI job that runs in
     # .github/workflows/ci.yml - GitHub only links jobs inside one workflow file.
-    # The ordering guarantee is instead: CI is the required status check on
-    # master, so a red test never reaches a merge. This job is additionally gated
-    # by the `production` environment below.
+    # The ordering guarantee is instead that CI is a required status check on
+    # master, plus the `production` environment gate below.
     environment: production
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      DEPLOY_KEY: ${{ runner.temp }}/deploy_key
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Install the deploy key
-        # The file redirect keeps the private key out of argv, out of any
-        # variable, and out of the transcript.
+        # The key is written by redirection rather than echoed through a pipe, so it
+        # never appears in any process's argv. `mkdir` first because `~/.ssh` does
+        # not exist on a fresh runner and `install` does not create parents.
         #
-        # `install -m 600 /dev/null ~/.ssh/...` FAILS on a GitHub runner:
-        # ~/.ssh does not exist until an ssh command creates it, and install
-        # does not create parents. So mkdir first. The key is written by
-        # redirecting rather than by echoing the secret through a pipe, which
-        # keeps it out of any intermediate process's argv.
-        #
-        # KEY_PATH is declared once here and reused by every later step, because
-        # writing to one path and reading from another only fails at run time with
-        # "Identity file ... not accessible" plus a bare "Permission denied
+        # KEY_PATH is declared once in `env:` above and reused by every step,
+        # because writing to one path and reading from another fails at run time
+        # with "Identity file ... not accessible" plus a bare "Permission denied
         # (publickey)" - which reads like a bad key rather than a missing file.
-        env:
-          KEY_PATH: ${{ runner.temp }}/deploy_key
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > "$KEY_PATH"
-          chmod 600 "$KEY_PATH"
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > "$DEPLOY_KEY"
+          chmod 600 "$DEPLOY_KEY"
           # A malformed key fails here rather than inside ssh with exit 255.
-          ssh-keygen -y -f "$KEY_PATH" >/dev/null
-          ssh-keyscan -H 43.134.105.109 >> ~/.ssh/known_hosts
+          ssh-keygen -y -f "$DEPLOY_KEY" >/dev/null
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
 
-      # A hosted runner has no route to 100.64.0.0/10, so VPS_HOST is the PUBLIC
-      # IP by design. Declared in `env:` on every step that uses it - interpolating
-      # a secret without one expands to empty and ssh exits 255 with a bare usage
-      # banner that names nothing.
+      # A hosted runner has no route to 100.64.0.0/10, so VPS_HOST is the PUBLIC IP
+      # by design.
       - name: Verify the host is reachable and the restriction holds
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          DEPLOY_KEY: ${{ runner.temp }}/deploy_key
         run: |
           set -euo pipefail
           # An allowlisted, meaningful command. `true` is NOT in the allowlist and
           # would be refused, which reads as "cannot SSH" when the key is fine.
-          out=$(ssh -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
-                "root@$VPS_HOST" "test -s /opt/discord-forum-bridge/src/main.js")
-          echo "bridge entrypoint present: $out"
+          ssh -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
+              "root@$VPS_HOST" "status"
 
           # Negative control: the forced command must refuse a shell. If this ever
-          # succeeds, the key is NOT restricted and the deploy must not proceed.
+          # succeeds the key is NOT restricted and the deploy must not proceed.
           if ssh -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
                "root@$VPS_HOST" "id" 2>/dev/null; then
             echo "::error::the deploy key obtained a shell - refusing to deploy"
@@ -83,46 +74,56 @@ jobs:
           fi
           echo "key is restricted to the deploy allowlist (shell refused as expected)"
 
+      - name: Record the mirror state before deploying
+        run: |
+          set -euo pipefail
+          # Captured before the deploy so the check afterwards compares against the
+          # real previous value rather than an assumed minimum.
+          ssh -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
+              "root@$VPS_HOST" "state" > "$RUNNER_TEMP/state-before.json"
+          node -e '
+            const s = require(process.env.RUNNER_TEMP + "/state-before.json");
+            console.log(
+              "cursors before: " + Object.keys(s.topicCursors || {}).length +
+              ", threads before: " + Object.keys(s.threads || {}).length
+            );
+          '
+
       - name: Deploy
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          DEPLOY_KEY: ${{ runner.temp }}/deploy_key
         run: |
           set -euo pipefail
           ssh -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
-              "root@$VPS_HOST" "bash /opt/discord-forum-bridge/deploy.sh"
+              "root@$VPS_HOST" "deploy"
 
-      - name: Post-deploy verification
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          DEPLOY_KEY: ${{ runner.temp }}/deploy_key
+      - name: Verify the bridge came back with its state intact
         run: |
           set -euo pipefail
-          # The deploy script restarts the bridge, but an independent read-back
-          # proves the unit is serving and that the mirror cursors survived -
-          # a lost state.json makes the next poll re-mirror whole topic
-          # histories into Discord.
+          # An independent read-back, because the deploy script's own word is not
+          # proof: a lost state.json makes the next poll re-mirror whole topic
+          # histories into Discord, and that is the failure worth catching here.
           status=$(ssh -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
-                     "root@$VPS_HOST" "systemctl --user is-active discord-forum-bridge.service")
+                     "root@$VPS_HOST" "unit")
           echo "bridge unit: $status"
           [ "$status" = "active" ] || { echo "::error::bridge is $status after deploy"; exit 1; }
 
           ssh -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
-              "root@$VPS_HOST" "cat /opt/discord-forum-bridge/data/state.json" \
-            | node -e '
-              let d = "";
-              process.stdin.on("data", (c) => (d += c)).on("end", () => {
-                const s = JSON.parse(d);
-                const cursors = Object.keys(s.topicCursors || {}).length;
-                const threads = Object.keys(s.threads || {}).length;
-                console.log(`mirror state after deploy: ${cursors} cursors, ${threads} threads`);
-                if (!cursors || !threads) {
-                  console.error("::error::mirror state is empty - the next poll would flood Discord");
-                  process.exit(1);
-                }
-              });
-            '
+              "root@$VPS_HOST" "state" > "$RUNNER_TEMP/state-after.json"
+          node -e '
+            const before = require(process.env.RUNNER_TEMP + "/state-before.json");
+            const after = require(process.env.RUNNER_TEMP + "/state-after.json");
+            const count = (s, k) => Object.keys(s[k] || {}).length;
+            const b = { c: count(before, "topicCursors"), t: count(before, "threads") };
+            const a = { c: count(after, "topicCursors"), t: count(after, "threads") };
+            console.log(`cursors: ${b.c} -> ${a.c}, threads: ${b.t} -> ${a.t}`);
+            // A shrink means cursors were lost, which floods Discord on the next
+            // poll. Growth is normal - a topic may have been mirrored during the
+            // deploy - so asserting equality would fail a healthy run.
+            if (a.c < b.c || a.t < b.t) {
+              console.error("::error::mirror state shrank across the deploy - the next poll would re-mirror history");
+              process.exit(1);
+            }
+          '
 
       - name: Clean up the key
         if: always()
-        run: rm -f "${{ runner.temp }}/deploy_key"
+        run: rm -f "$DEPLOY_KEY"
