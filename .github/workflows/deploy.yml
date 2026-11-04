@@ -29,9 +29,11 @@ jobs:
     # The ordering guarantee is instead that CI is a required status check on
     # master, plus the `production` environment gate below.
     environment: production
+    # `runner.*` context is not available in job-level `env:` - referencing it here
+    # makes the whole workflow invalid, and GitHub reports that as a failed run with
+    # zero jobs rather than as a schema error. It is declared per step instead.
     env:
       VPS_HOST: ${{ secrets.VPS_HOST }}
-      DEPLOY_KEY: ${{ runner.temp }}/deploy_key
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -41,10 +43,12 @@ jobs:
         # never appears in any process's argv. `mkdir` first because `~/.ssh` does
         # not exist on a fresh runner and `install` does not create parents.
         #
-        # KEY_PATH is declared once in `env:` above and reused by every step,
-        # because writing to one path and reading from another fails at run time
-        # with "Identity file ... not accessible" plus a bare "Permission denied
-        # (publickey)" - which reads like a bad key rather than a missing file.
+        # DEPLOY_KEY is declared on every step that uses it rather than once at job
+        # level: `runner.temp` is not available in job-level `env:`, and referencing
+        # it there makes the workflow invalid in a way GitHub reports as a failed run
+        # with zero jobs instead of as a schema error.
+        env:
+          DEPLOY_KEY: ${{ runner.temp }}/deploy_key
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
@@ -58,6 +62,8 @@ jobs:
       # A hosted runner has no route to 100.64.0.0/10, so VPS_HOST is the PUBLIC IP
       # by design.
       - name: Verify the host is reachable and the restriction holds
+        env:
+          DEPLOY_KEY: ${{ runner.temp }}/deploy_key
         run: |
           set -euo pipefail
           # An allowlisted, meaningful command. `true` is NOT in the allowlist and
@@ -75,6 +81,8 @@ jobs:
           echo "key is restricted to the deploy allowlist (shell refused as expected)"
 
       - name: Record the mirror state before deploying
+        env:
+          DEPLOY_KEY: ${{ runner.temp }}/deploy_key
         run: |
           set -euo pipefail
           # Captured before the deploy so the check afterwards compares against the
@@ -90,12 +98,16 @@ jobs:
           '
 
       - name: Deploy
+        env:
+          DEPLOY_KEY: ${{ runner.temp }}/deploy_key
         run: |
           set -euo pipefail
           ssh -i "$DEPLOY_KEY" -o BatchMode=yes -o ConnectTimeout=20 \
               "root@$VPS_HOST" "deploy"
 
       - name: Verify the bridge came back with its state intact
+        env:
+          DEPLOY_KEY: ${{ runner.temp }}/deploy_key
         run: |
           set -euo pipefail
           # An independent read-back, because the deploy script's own word is not
@@ -126,4 +138,6 @@ jobs:
 
       - name: Clean up the key
         if: always()
+        env:
+          DEPLOY_KEY: ${{ runner.temp }}/deploy_key
         run: rm -f "$DEPLOY_KEY"
